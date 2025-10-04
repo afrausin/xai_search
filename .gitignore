@@ -1,0 +1,31 @@
+# API Keys and Environment
+.env
+.env.local
+*.key
+
+# Downloads and CSVs
+downloads/
+*.csv
+
+# User-specific settings and results
+batch-settings.json
+batch_search_*.csv
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Node
+node_modules/
+
