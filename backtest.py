@@ -61,7 +61,12 @@ def precompute_indicators(df: pd.DataFrame) -> Dict:
 def fast_backtest_dynamic(indicators: Dict, base_threshold: float, ext_lb: int,
                           hurst_lb: int, max_hurst: float, min_exit: int, max_exit: int,
                           inertia_sens: float, duration_weight: float = 0.1,
-                          amplitude_weight: float = 0.5) -> Dict:
+                          amplitude_weight: float = 0.5,
+                          short_threshold_mult: float = 1.0,
+                          short_max_hurst_adj: float = 0.0,
+                          short_exit_mult: float = 1.0,
+                          short_min_duration: int = 0,
+                          short_min_amp_ratio: float = 1.0) -> Dict:
     """
     Fast backtest with inertia-based dynamic entry and exit
 
@@ -69,6 +74,13 @@ def fast_backtest_dynamic(indicators: Dict, base_threshold: float, ext_lb: int,
     - Formation duration: How long price has been extended (accumulated energy)
     - Wave amplitude: Magnitude of recent price swings (momentum)
     - Both affect the exit timing based on physical market intuition
+
+    Asymmetric parameters for long/short:
+    - short_threshold_mult: Multiply base threshold for shorts (>1 = stricter)
+    - short_max_hurst_adj: Lower the max_hurst for shorts (more negative = stricter)
+    - short_exit_mult: Multiply exit bars for shorts (different hold times)
+    - short_min_duration: Minimum bars in extended state before shorting
+    - short_min_amp_ratio: Minimum wave amplitude ratio (vs mean) for shorts
     """
     close = indicators['close']
     n = indicators['n']
@@ -84,6 +96,9 @@ def fast_backtest_dynamic(indicators: Dict, base_threshold: float, ext_lb: int,
     min_idx = max(hurst_lb, ext_lb, 25)
     base_bars = (min_exit + max_exit) / 2
 
+    # Asymmetric parameters
+    short_max_hurst = max_hurst + short_max_hurst_adj
+
     # Normalize wave amplitude
     wave_amp_mean = np.mean(wave_amp[wave_amp > 0]) if np.any(wave_amp > 0) else 1.0
 
@@ -94,12 +109,9 @@ def fast_backtest_dynamic(indicators: Dict, base_threshold: float, ext_lb: int,
         dur = duration[i]
         amp = wave_amp[i]
 
-        if h >= max_hurst:
-            continue
-
         # Dynamic threshold based on Hurst and volatility
         hurst_factor = 0.5 + h * inertia_sens
-        threshold = base_threshold * hurst_factor * (0.8 + vol_adj * 0.4)
+        base_threshold_adj = base_threshold * hurst_factor * (0.8 + vol_adj * 0.4)
 
         # Inertia-based exit calculation:
         # 1. Hurst factor: Lower Hurst = faster mean reversion = shorter hold
@@ -110,25 +122,29 @@ def fast_backtest_dynamic(indicators: Dict, base_threshold: float, ext_lb: int,
 
         # Combined inertia calculation
         # Lower Hurst speeds up exit, longer duration/higher amplitude slow it down
-        exit_bars = int(np.clip(
-            base_bars * hurst_factor * duration_factor * amplitude_factor,
-            min_exit, max_exit
-        ))
-
-        if i + exit_bars >= n:
-            continue
+        base_exit_bars = base_bars * hurst_factor * duration_factor * amplitude_factor
 
         # Long signal
-        if z < -threshold:
+        if h < max_hurst and z < -base_threshold_adj:
+            exit_bars = int(np.clip(base_exit_bars, min_exit, max_exit))
+            if i + exit_bars >= n:
+                continue
             entry = close[i]
             exit_price = close[i + exit_bars]
             ret = (exit_price - entry) / entry
             long_wins.append(ret > 0)
 
-        # Short signal
-        elif z > threshold:
+        # Short signal - with asymmetric adjustments and inertia requirements
+        elif h < short_max_hurst and z > base_threshold_adj * short_threshold_mult:
+            # Require minimum accumulated inertia for shorts
+            amp_ratio = amp / wave_amp_mean if wave_amp_mean > 0 else 1.0
+            if dur < short_min_duration or amp_ratio < short_min_amp_ratio:
+                continue
+            short_exit_bars = int(np.clip(base_exit_bars * short_exit_mult, min_exit, max_exit))
+            if i + short_exit_bars >= n:
+                continue
             entry = close[i]
-            exit_price = close[i + exit_bars]
+            exit_price = close[i + short_exit_bars]
             ret = (entry - exit_price) / entry
             short_wins.append(ret > 0)
 
@@ -186,26 +202,37 @@ def optimize_signal(precomputed: Dict[str, Dict], target: float = 60.0) -> Dict:
     import itertools
 
     print(f"\n{'='*60}")
-    print(f"PURE HURST WITH DYNAMIC INERTIA")
+    print(f"PURE HURST WITH DYNAMIC INERTIA (ASYMMETRIC)")
     print(f"Target: {target}% hit rate on both longs and shorts")
     print(f"{'='*60}\n")
 
-    # Balanced search - focusing on min(long_hr, short_hr) with sufficient trades
-    base_thresholds = [3.0, 3.2, 3.5, 3.8, 4.0]
-    ext_lbs = [10, 15]
-    hurst_lbs = [15, 20]
-    max_hursts = [0.38, 0.40, 0.42, 0.45]  # Slightly relaxed for more trades
+    # Core parameters - refined search near optimum
+    base_thresholds = [3.2, 3.5, 3.8]
+    ext_lbs = [15]
+    hurst_lbs = [20]
+    max_hursts = [0.35, 0.38, 0.40]
     min_exits = [3, 4, 5]
-    max_exits = [5, 6, 8]
+    max_exits = [6, 7, 8]
     inertia_sensitivities = [0.6, 0.8, 1.0]
-    duration_weights = [0.02, 0.05, 0.08]
-    amplitude_weights = [0.2, 0.35, 0.5]
+    duration_weights = [0.02, 0.05]
+    amplitude_weights = [0.35, 0.5]
+
+    # Asymmetric parameters for shorts - focus on what works
+    short_threshold_mults = [1.0, 1.1]  # Require higher z-score for shorts
+    short_max_hurst_adjs = [0.0, -0.02, -0.05]  # Stricter Hurst filter for shorts
+    short_exit_mults = [0.8, 1.0, 1.2]  # Different hold times for shorts
+
+    # Inertia requirements for shorts (key innovation) - fine-tune around 5 duration, 1.5 amp
+    short_min_durations = [3, 4, 5, 6]  # Minimum bars in extended state before shorting
+    short_min_amp_ratios = [1.2, 1.3, 1.4, 1.5]  # Minimum amplitude ratio for shorts
 
     # Generate all valid parameter combinations
     all_configs = []
-    for base_thresh, ext_lb, hurst_lb, max_hurst, min_exit, max_exit, inertia, dur_w, amp_w in itertools.product(
+    for base_thresh, ext_lb, hurst_lb, max_hurst, min_exit, max_exit, inertia, dur_w, amp_w, short_tm, short_ha, short_em, short_md, short_mar in itertools.product(
         base_thresholds, ext_lbs, hurst_lbs, max_hursts, min_exits, max_exits,
-        inertia_sensitivities, duration_weights, amplitude_weights
+        inertia_sensitivities, duration_weights, amplitude_weights,
+        short_threshold_mults, short_max_hurst_adjs, short_exit_mults,
+        short_min_durations, short_min_amp_ratios
     ):
         if min_exit >= max_exit:
             continue
@@ -219,6 +246,11 @@ def optimize_signal(precomputed: Dict[str, Dict], target: float = 60.0) -> Dict:
             'inertia_sens': inertia,
             'duration_weight': dur_w,
             'amplitude_weight': amp_w,
+            'short_threshold_mult': short_tm,
+            'short_max_hurst_adj': short_ha,
+            'short_exit_mult': short_em,
+            'short_min_duration': short_md,
+            'short_min_amp_ratio': short_mar,
         }
         all_configs.append((precomputed, params))
 
@@ -315,10 +347,20 @@ def main():
         print(f"  Base Threshold: {p['base_threshold']:.2f}")
         print(f"  Extension Lookback: {p['ext_lb']}")
         print(f"  Hurst Lookback: {p['hurst_lb']}")
-        print(f"  Max Hurst: {p['max_hurst']:.2f}")
+        print(f"  Max Hurst (Long): {p['max_hurst']:.2f}")
         print(f"  Min Exit Bars: {p['min_exit']}")
         print(f"  Max Exit Bars: {p['max_exit']}")
         print(f"  Inertia Sensitivity: {p['inertia_sens']:.2f}")
+        print(f"  Duration Weight: {p.get('duration_weight', 0.05):.2f}")
+        print(f"  Amplitude Weight: {p.get('amplitude_weight', 0.35):.2f}")
+        if 'short_threshold_mult' in p:
+            print(f"\n  Asymmetric Short Parameters:")
+            print(f"    Short Threshold Mult: {p['short_threshold_mult']:.2f}")
+            print(f"    Short Max Hurst Adj: {p['short_max_hurst_adj']:.2f}")
+            print(f"    Short Exit Mult: {p['short_exit_mult']:.2f}")
+            if 'short_min_duration' in p:
+                print(f"    Short Min Duration: {p['short_min_duration']}")
+                print(f"    Short Min Amp Ratio: {p['short_min_amp_ratio']:.2f}")
 
     return result
 
