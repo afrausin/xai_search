@@ -117,6 +117,8 @@ def high_conviction_backtest(indicators: Dict, ticker: str,
                               # Lookbacks
                               ext_lb: int = 20,
                               hurst_lb: int = 25,
+                              # Risk adjustment
+                              target_volatility: float = 0.15,  # 15% annualized target vol
                               ) -> List[Dict]:
     """
     High conviction backtest - only take the best setups
@@ -129,6 +131,7 @@ def high_conviction_backtest(indicators: Dict, ticker: str,
     duration = indicators['durations'].get(min(ext_lb, 20), indicators['durations'][15])
     wave_amp = indicators['wave_amplitude']
     volatility = indicators['volatility']
+    beta = indicators['beta']
 
     trades = []
     min_idx = max(hurst_lb, ext_lb, 60, 30)
@@ -167,6 +170,15 @@ def high_conviction_backtest(indicators: Dict, ticker: str,
         vol_factor = min(vol / 0.25, 1.5)  # Scale based on volatility
         exit_bars = int(np.clip(min_exit + (max_exit - min_exit) * vol_factor * (1 - h), min_exit, max_exit))
 
+        # Get beta at entry (clamp to reasonable range)
+        b = beta[i]
+        b = np.clip(b, 0.3, 3.0) if not np.isnan(b) else 1.0
+
+        # Position size for volatility targeting
+        # If stock has 30% vol and target is 15%, size = 0.5x
+        position_size = target_volatility / vol if vol > 0 else 1.0
+        position_size = np.clip(position_size, 0.25, 2.0)  # Limit leverage
+
         # Long signal - very negative z-score
         if z < -z_threshold:
             if i + exit_bars >= n:
@@ -175,16 +187,26 @@ def high_conviction_backtest(indicators: Dict, ticker: str,
             exit_price = close[i + exit_bars]
             ret = (exit_price - entry) / entry
 
+            # Adjusted returns
+            beta_adj_ret = ret / b  # Beta-neutralized return
+            vol_adj_ret = ret * position_size  # Vol-targeted return
+
             trades.append({
                 'direction': 'long',
                 'ticker': ticker,
                 'sector': sector,
                 'return': ret,
+                'beta_adj_return': beta_adj_ret,
+                'vol_adj_return': vol_adj_ret,
+                'position_size': position_size,
+                'beta': b,
                 'hold_days': exit_bars,
                 'z_score': z,
                 'hurst': h,
                 'volatility': vol,
                 'win': ret > 0,
+                'beta_adj_win': beta_adj_ret > 0,
+                'vol_adj_win': vol_adj_ret > 0,
             })
 
         # Short signal - very positive z-score
@@ -195,16 +217,26 @@ def high_conviction_backtest(indicators: Dict, ticker: str,
             exit_price = close[i + exit_bars]
             ret = (entry - exit_price) / entry
 
+            # Adjusted returns (for shorts, beta adjustment is inverted)
+            beta_adj_ret = ret / b  # Beta-neutralized return
+            vol_adj_ret = ret * position_size  # Vol-targeted return
+
             trades.append({
                 'direction': 'short',
                 'ticker': ticker,
                 'sector': sector,
                 'return': ret,
+                'beta_adj_return': beta_adj_ret,
+                'vol_adj_return': vol_adj_ret,
+                'position_size': position_size,
+                'beta': b,
                 'hold_days': exit_bars,
                 'z_score': z,
                 'hurst': h,
                 'volatility': vol,
                 'win': ret > 0,
+                'beta_adj_win': beta_adj_ret > 0,
+                'vol_adj_win': vol_adj_ret > 0,
             })
 
     return trades
