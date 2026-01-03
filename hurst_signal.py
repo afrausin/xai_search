@@ -1,52 +1,33 @@
 """
-Extreme Hurst Trading Signal - Production Version
+Extreme Hurst Trading Signal - Pure Hurst with Dynamic Inertia
 Replication of Parallax's extreme hurst technical signal
 
-Optimized parameters achieving:
-- Long hit rate: 68.61%
-- Short hit rate: 60.50%
-- Tested on 99 tickers over 2 years of data
-
-Focuses on top and bottom extensions with position sizing based on signal strength.
-Each signal is monetized based on indicator strength (Hurst value, RSI extreme, z-score).
+Dynamic entry: Threshold adapts based on Hurst (mean-reversion strength)
+Dynamic exit: Hold period based on extension inertia and Hurst
+No RSI - pure Hurst-based model
 """
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from typing import Dict, List, Tuple
+from typing import Dict
 import warnings
 warnings.filterwarnings('ignore')
-
-
-# Optimal parameters found through backtesting
-OPTIMAL_PARAMS = {
-    'extension_threshold': 2.20,
-    'extension_lookback': 15,
-    'hurst_lookback': 20,
-    'max_hurst': 0.45,
-    'exit_bars': 7,
-    'use_rsi': True,
-    'rsi_oversold': 20,
-    'rsi_overbought': 80,
-}
 
 
 def calculate_hurst(prices: np.ndarray, lookback: int = 20) -> np.ndarray:
     """
     Calculate rolling Hurst exponent using variance ratio method
 
-    Hurst < 0.5: Mean-reverting (good for counter-trend signals)
-    Hurst = 0.5: Random walk
-    Hurst > 0.5: Trending
-
-    We filter for low Hurst (mean-reverting) conditions to trade extensions.
+    H < 0.5: Mean-reverting (lower = stronger mean reversion)
+    H = 0.5: Random walk
+    H > 0.5: Trending
     """
     n = len(prices)
     hurst = np.full(n, 0.5)
     log_prices = np.log(np.maximum(prices, 1e-10))
 
-    for i in range(lookback, n, 10):  # Calculate every 10 bars for efficiency
+    for i in range(lookback, n, 5):  # Every 5 bars
         segment = log_prices[max(0, i-lookback):i]
         if len(segment) >= 15:
             lags = [2, 4, 8]
@@ -63,28 +44,15 @@ def calculate_hurst(prices: np.ndarray, lookback: int = 20) -> np.ndarray:
                 slope, _, _, _, _ = stats.linregress(log_lags, log_taus)
                 hurst[i] = np.clip(slope, 0.0, 1.0)
 
-    # Forward fill values
+    # Forward fill
     for i in range(1, n):
-        if hurst[i] == 0.5 and hurst[i-1] != 0.5 and i % 10 != 0:
+        if hurst[i] == 0.5 and hurst[i-1] != 0.5 and i % 5 != 0:
             hurst[i] = hurst[i-1]
 
     return hurst
 
 
-def calculate_rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
-    """Calculate RSI indicator"""
-    delta = np.diff(close)
-    delta = np.insert(delta, 0, 0)
-    gains = np.where(delta > 0, delta, 0)
-    losses = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gains).rolling(period, min_periods=1).mean().values
-    avg_loss = pd.Series(losses).rolling(period, min_periods=1).mean().values
-    rs = np.where(avg_loss > 0, avg_gain / avg_loss, 100)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def calculate_zscore(close: np.ndarray, lookback: int = 15) -> np.ndarray:
+def calculate_zscore(close: np.ndarray, lookback: int) -> np.ndarray:
     """Calculate rolling z-score of price"""
     roll_mean = pd.Series(close).rolling(lookback).mean().values
     roll_std = pd.Series(close).rolling(lookback).std().values
@@ -92,186 +60,223 @@ def calculate_zscore(close: np.ndarray, lookback: int = 15) -> np.ndarray:
     return (close - roll_mean) / roll_std
 
 
+def calculate_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate Average True Range for volatility-based inertia"""
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    return pd.Series(tr).rolling(period, min_periods=1).mean().values
+
+
+def calculate_formation_duration(close: np.ndarray, zscore: np.ndarray, threshold: float = 1.0) -> np.ndarray:
+    """
+    Calculate how long price has been in an extended state (formation duration)
+
+    This measures the "duration of log formation" - how many bars the price has been
+    continuously above/below a threshold. Longer formations = more accumulated energy
+    = potentially longer time to revert.
+    """
+    n = len(close)
+    duration = np.zeros(n)
+
+    for i in range(1, n):
+        # Count consecutive bars in extended state
+        if abs(zscore[i]) > threshold:
+            # Check if same direction as previous
+            if zscore[i] * zscore[i-1] > 0:  # Same sign
+                duration[i] = duration[i-1] + 1
+            else:
+                duration[i] = 1
+        else:
+            duration[i] = 0
+
+    return duration
+
+
+def calculate_wave_amplitude(close: np.ndarray, lookback: int = 20) -> np.ndarray:
+    """
+    Calculate the amplitude of recent price waves
+
+    This measures the "amplitude of waves" - the magnitude of price swings.
+    Larger amplitudes indicate more momentum that needs to dissipate.
+    """
+    n = len(close)
+    amplitude = np.zeros(n)
+
+    for i in range(lookback, n):
+        segment = close[max(0, i-lookback):i+1]
+        # Amplitude = (max - min) / mean, normalized
+        range_val = segment.max() - segment.min()
+        mean_val = segment.mean()
+        if mean_val > 0:
+            amplitude[i] = range_val / mean_val
+
+    return amplitude
+
+
 class ExtremeHurstSignal:
     """
-    Extreme Hurst Trading Signal Generator
+    Pure Hurst-based signal with dynamic entry and exit based on inertia
 
-    Generates mean-reversion signals at extreme price extensions when:
-    1. Price z-score exceeds threshold (extreme extension)
-    2. Hurst exponent indicates mean-reverting conditions
-    3. RSI confirms overbought/oversold (optional but improves hit rate)
+    Inertia Concept:
+    - Entry threshold adapts to Hurst: Lower Hurst = more mean-reverting = lower threshold
+    - Exit bars adapt to extension + Hurst: Larger extension + lower Hurst = faster reversion expected
 
-    Position sizing is based on signal strength:
-    - Extension magnitude (how far price deviated)
-    - Hurst value (lower = stronger mean reversion expectation)
-    - RSI extreme level
-
-    Backtest Results (99 tickers, 2Y data):
-    - Long hit rate: 68.61%
-    - Short hit rate: 60.50%
-    - Total trades: 337
+    The "inertia" represents how strongly price tends to continue vs revert:
+    - Low inertia (low Hurst) = quick reversion, can enter smaller moves, exit faster
+    - High inertia (high Hurst) = slow reversion, need larger moves, hold longer
     """
 
     def __init__(
         self,
-        extension_threshold: float = OPTIMAL_PARAMS['extension_threshold'],
-        extension_lookback: int = OPTIMAL_PARAMS['extension_lookback'],
-        hurst_lookback: int = OPTIMAL_PARAMS['hurst_lookback'],
-        max_hurst: float = OPTIMAL_PARAMS['max_hurst'],
-        exit_bars: int = OPTIMAL_PARAMS['exit_bars'],
-        use_rsi: bool = OPTIMAL_PARAMS['use_rsi'],
-        rsi_oversold: float = OPTIMAL_PARAMS['rsi_oversold'],
-        rsi_overbought: float = OPTIMAL_PARAMS['rsi_overbought'],
+        base_threshold: float = 2.5,
+        extension_lookback: int = 15,
+        hurst_lookback: int = 20,
+        max_hurst: float = 0.55,
+        min_exit_bars: int = 3,
+        max_exit_bars: int = 15,
+        inertia_sensitivity: float = 1.0,
     ):
         """
-        Initialize with optimized parameters
+        Initialize with dynamic parameters
 
         Args:
-            extension_threshold: Z-score threshold for extreme extension (2.2 optimal)
-            extension_lookback: Lookback period for z-score calculation (15 bars)
-            hurst_lookback: Lookback for Hurst exponent (20 bars)
-            max_hurst: Maximum Hurst value to generate signals (0.45 = mean-reverting)
-            exit_bars: Bars to hold position (7 bars)
-            use_rsi: Whether to use RSI filter (True)
-            rsi_oversold: RSI oversold threshold for longs (20)
-            rsi_overbought: RSI overbought threshold for shorts (80)
+            base_threshold: Base z-score threshold (adjusted by Hurst)
+            extension_lookback: Lookback for z-score
+            hurst_lookback: Lookback for Hurst calculation
+            max_hurst: Maximum Hurst to generate signals
+            min_exit_bars: Minimum hold period
+            max_exit_bars: Maximum hold period
+            inertia_sensitivity: How much Hurst affects dynamics (1.0 = normal)
         """
-        self.extension_threshold = extension_threshold
+        self.base_threshold = base_threshold
         self.extension_lookback = extension_lookback
         self.hurst_lookback = hurst_lookback
         self.max_hurst = max_hurst
-        self.exit_bars = exit_bars
-        self.use_rsi = use_rsi
-        self.rsi_oversold = rsi_oversold
-        self.rsi_overbought = rsi_overbought
+        self.min_exit_bars = min_exit_bars
+        self.max_exit_bars = max_exit_bars
+        self.inertia_sensitivity = inertia_sensitivity
+
+    def get_dynamic_threshold(self, hurst: float) -> float:
+        """
+        Dynamic entry threshold based on Hurst (inertia)
+
+        Lower Hurst = more mean-reverting = can enter at smaller extensions
+        Higher Hurst = less mean-reverting = need larger extensions
+        """
+        # Scale threshold: H=0.3 -> 0.7x base, H=0.5 -> 1.0x base, H=0.6 -> 1.2x base
+        hurst_factor = 0.5 + hurst * self.inertia_sensitivity
+        return self.base_threshold * hurst_factor
+
+    def get_dynamic_exit_bars(self, hurst: float, zscore: float) -> int:
+        """
+        Dynamic exit bars based on inertia
+
+        - Lower Hurst = faster mean reversion = shorter hold
+        - Larger extension = may need more time = longer hold
+        - Balance between the two
+        """
+        # Hurst component: lower Hurst = shorter hold
+        # H=0.3 -> 0.6x, H=0.5 -> 1.0x, H=0.6 -> 1.2x
+        hurst_factor = 0.5 + hurst * self.inertia_sensitivity
+
+        # Extension component: larger extension = longer hold (takes more time to revert)
+        # z=2 -> 0.8x, z=3 -> 1.0x, z=4 -> 1.2x
+        extension_factor = 0.6 + abs(zscore) * 0.15
+
+        # Combine: base * hurst_factor * extension_factor
+        base_bars = (self.min_exit_bars + self.max_exit_bars) / 2
+        dynamic_bars = base_bars * hurst_factor * extension_factor
+
+        return int(np.clip(dynamic_bars, self.min_exit_bars, self.max_exit_bars))
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Generate trading signals
-
-        Args:
-            df: DataFrame with OHLCV data (requires 'Close' column minimum)
-
-        Returns:
-            DataFrame with added columns:
-            - signal: 1 (long), -1 (short), 0 (no signal)
-            - position_size: Position size based on signal strength (0.5 to 3.0x)
-            - hurst: Rolling Hurst exponent
-            - zscore: Rolling price z-score
-            - rsi: RSI indicator
-        """
+        """Generate signals with dynamic entry and exit"""
         df = df.copy()
         close = df['Close'].values.astype(float)
+        high = df['High'].values.astype(float) if 'High' in df.columns else close
+        low = df['Low'].values.astype(float) if 'Low' in df.columns else close
         n = len(close)
 
         # Calculate indicators
         hurst = calculate_hurst(close, self.hurst_lookback)
         zscore = calculate_zscore(close, self.extension_lookback)
-        rsi = calculate_rsi(close)
+        atr = calculate_atr(high, low, close)
 
-        # Initialize signal arrays
+        # Normalize ATR for volatility-adjusted inertia
+        atr_ma = pd.Series(atr).rolling(50, min_periods=1).mean().values
+        atr_ratio = np.where(atr_ma > 0, atr / atr_ma, 1.0)
+
         signals = np.zeros(n)
         position_sizes = np.zeros(n)
+        exit_bars_arr = np.zeros(n, dtype=int)
+        dynamic_thresholds = np.zeros(n)
 
         min_idx = max(self.hurst_lookback, self.extension_lookback, 20)
 
-        for i in range(min_idx, n - self.exit_bars):
-            z = zscore[i]
+        for i in range(min_idx, n):
             h = hurst[i]
-            r = rsi[i]
+            z = zscore[i]
+            vol_adj = atr_ratio[i]
 
-            # Long signal: Bottom extension in mean-reverting conditions
-            if z < -self.extension_threshold and h < self.max_hurst:
-                if not self.use_rsi or r < self.rsi_oversold:
-                    signals[i] = 1
+            # Dynamic threshold adjusted for Hurst and volatility
+            threshold = self.get_dynamic_threshold(h) * (0.8 + vol_adj * 0.4)
+            dynamic_thresholds[i] = threshold
 
-                    # Position sizing based on signal strength
-                    extension_strength = min(abs(z) / self.extension_threshold, 2.0)
-                    hurst_boost = 1.0 + max(0, 0.5 - h) * 2  # Lower Hurst = higher boost
-                    rsi_boost = 1.0 + max(0, (self.rsi_oversold - r) / 30)
-                    position_sizes[i] = min(extension_strength * hurst_boost * rsi_boost, 3.0)
+            # Check if Hurst indicates mean-reverting regime
+            if h >= self.max_hurst:
+                continue
 
-            # Short signal: Top extension in mean-reverting conditions
-            elif z > self.extension_threshold and h < self.max_hurst:
-                if not self.use_rsi or r > self.rsi_overbought:
-                    signals[i] = -1
+            # Long signal: Bottom extension
+            if z < -threshold:
+                signals[i] = 1
+                exit_bars = self.get_dynamic_exit_bars(h, z)
+                exit_bars_arr[i] = exit_bars
 
-                    extension_strength = min(abs(z) / self.extension_threshold, 2.0)
-                    hurst_boost = 1.0 + max(0, 0.5 - h) * 2
-                    rsi_boost = 1.0 + max(0, (r - self.rsi_overbought) / 30)
-                    position_sizes[i] = min(extension_strength * hurst_boost * rsi_boost, 3.0)
+                # Position size based on signal strength (inertia-adjusted)
+                extension_strength = min(abs(z) / threshold, 2.0)
+                hurst_boost = 1.0 + max(0, 0.5 - h) * 2 * self.inertia_sensitivity
+                position_sizes[i] = min(extension_strength * hurst_boost, 3.0)
+
+            # Short signal: Top extension
+            elif z > threshold:
+                signals[i] = -1
+                exit_bars = self.get_dynamic_exit_bars(h, z)
+                exit_bars_arr[i] = exit_bars
+
+                extension_strength = min(abs(z) / threshold, 2.0)
+                hurst_boost = 1.0 + max(0, 0.5 - h) * 2 * self.inertia_sensitivity
+                position_sizes[i] = min(extension_strength * hurst_boost, 3.0)
 
         df['signal'] = signals
         df['position_size'] = position_sizes
+        df['exit_bars'] = exit_bars_arr
+        df['dynamic_threshold'] = dynamic_thresholds
         df['hurst'] = hurst
         df['zscore'] = zscore
-        df['rsi'] = rsi
+        df['atr_ratio'] = atr_ratio
 
         return df
 
-    def get_current_signal(self, df: pd.DataFrame) -> Dict:
-        """
-        Get current signal for live trading
-
-        Args:
-            df: Recent price history (at least extension_lookback + hurst_lookback bars)
-
-        Returns:
-            Dict with signal info:
-            - signal: 1 (long), -1 (short), 0 (no signal)
-            - position_size: Recommended position size multiplier
-            - hurst: Current Hurst exponent
-            - zscore: Current z-score
-            - rsi: Current RSI
-            - reason: String explaining the signal
-        """
-        df_signals = self.generate_signals(df)
-        last_idx = len(df_signals) - 1
-
-        signal = int(df_signals.iloc[last_idx]['signal'])
-        size = float(df_signals.iloc[last_idx]['position_size'])
-        hurst = float(df_signals.iloc[last_idx]['hurst'])
-        zscore = float(df_signals.iloc[last_idx]['zscore'])
-        rsi = float(df_signals.iloc[last_idx]['rsi'])
-
-        if signal == 1:
-            reason = f"LONG: Bottom extension (z={zscore:.2f}), mean-reverting (H={hurst:.2f}), oversold (RSI={rsi:.1f})"
-        elif signal == -1:
-            reason = f"SHORT: Top extension (z={zscore:.2f}), mean-reverting (H={hurst:.2f}), overbought (RSI={rsi:.1f})"
-        else:
-            reason = f"No signal: z={zscore:.2f}, H={hurst:.2f}, RSI={rsi:.1f}"
-
-        return {
-            'signal': signal,
-            'position_size': size,
-            'hurst': hurst,
-            'zscore': zscore,
-            'rsi': rsi,
-            'reason': reason,
-            'exit_bars': self.exit_bars,
-        }
-
     def backtest(self, df: pd.DataFrame) -> Dict:
-        """
-        Backtest the signal on historical data
-
-        Args:
-            df: DataFrame with OHLCV data
-
-        Returns:
-            Dict with backtest results
-        """
+        """Backtest with dynamic exit bars per trade"""
         df = self.generate_signals(df)
         close = df['Close'].values
         signals = df['signal'].values
         position_sizes = df['position_size'].values
+        exit_bars_arr = df['exit_bars'].values
 
         trades = []
+        n = len(df)
 
-        for i in range(len(df) - self.exit_bars):
+        for i in range(n):
             if signals[i] != 0:
+                exit_bars = int(exit_bars_arr[i])
+                if i + exit_bars >= n:
+                    continue
+
                 entry_price = close[i]
-                exit_price = close[i + self.exit_bars]
+                exit_price = close[i + exit_bars]
                 direction = signals[i]
                 size = position_sizes[i]
 
@@ -284,6 +289,7 @@ class ExtremeHurstSignal:
                     'entry_idx': i,
                     'entry_price': entry_price,
                     'exit_price': exit_price,
+                    'exit_bars': exit_bars,
                     'direction': direction,
                     'position_size': size,
                     'pct_return': pct_return,
@@ -292,14 +298,8 @@ class ExtremeHurstSignal:
                 })
 
         if not trades:
-            return {
-                'total_trades': 0,
-                'long_trades': 0,
-                'short_trades': 0,
-                'long_hit_rate': 0,
-                'short_hit_rate': 0,
-                'overall_hit_rate': 0,
-            }
+            return {'total_trades': 0, 'long_trades': 0, 'short_trades': 0,
+                    'long_hit_rate': 0, 'short_hit_rate': 0}
 
         trades_df = pd.DataFrame(trades)
         long_trades = trades_df[trades_df['direction'] == 1]
@@ -316,33 +316,6 @@ class ExtremeHurstSignal:
             'overall_hit_rate': trades_df['win'].mean() * 100,
             'avg_return': trades_df['pct_return'].mean() * 100,
             'avg_sized_return': trades_df['sized_return'].mean() * 100,
-            'total_return': trades_df['sized_return'].sum() * 100,
+            'avg_exit_bars': trades_df['exit_bars'].mean(),
             'trades': trades_df
         }
-
-
-def get_signal(prices: pd.DataFrame) -> Dict:
-    """
-    Convenience function to get current signal
-
-    Args:
-        prices: DataFrame with 'Close' column
-
-    Returns:
-        Signal info dict
-    """
-    signal = ExtremeHurstSignal()
-    return signal.get_current_signal(prices)
-
-
-if __name__ == "__main__":
-    # Example usage
-    print("Extreme Hurst Trading Signal")
-    print("=" * 40)
-    print(f"Optimal Parameters:")
-    for k, v in OPTIMAL_PARAMS.items():
-        print(f"  {k}: {v}")
-    print("\nBacktest Results (99 tickers, 2Y):")
-    print("  Long hit rate: 68.61%")
-    print("  Short hit rate: 60.50%")
-    print("  Total trades: 337")
