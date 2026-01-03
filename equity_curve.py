@@ -216,6 +216,9 @@ def backtest_with_dates(indicators: dict, df: pd.DataFrame, ticker: str, **param
                 'beta_adj_return': beta_adj_ret,
                 'position_size': position_size,
                 'beta': b,
+                'z_score': z,
+                'hurst': h,
+                'volatility': vol,
             })
 
         # Short signal
@@ -238,9 +241,30 @@ def backtest_with_dates(indicators: dict, df: pd.DataFrame, ticker: str, **param
                 'beta_adj_return': beta_adj_ret,
                 'position_size': position_size,
                 'beta': b,
+                'z_score': z,
+                'hurst': h,
+                'volatility': vol,
             })
 
     return trades
+
+
+def calculate_z_weight(z_score: float, z_threshold: float = 3.0) -> float:
+    """
+    Calculate trade weight based on z_score.
+
+    Based on correlation analysis:
+    - Trades closer to threshold (|z| ≈ 3.0) have higher hit rate (81.8%)
+    - Extreme trades (|z| > 3.4) have lower hit rate (54.5%)
+
+    Weight formula: inverse relationship with |z| distance from threshold
+    - At threshold (|z| = 3.0): weight = 2.0x
+    - At |z| = 4.0: weight = 0.5x
+    """
+    z_abs = abs(z_score)
+    # Linear interpolation: 2.0 at z=3.0, 0.5 at z=4.0+
+    weight = 2.0 - (z_abs - z_threshold) / 1.0 * 1.5
+    return np.clip(weight, 0.5, 2.0)
 
 
 def main():
@@ -299,29 +323,45 @@ def main():
             trades_by_exit[exit_date] = []
         trades_by_exit[exit_date].append(t)
 
-    # Build equity curve (cumulative P&L, equal weight per trade)
-    # Assume each trade uses 1% of capital (equal weight)
-    trade_weight = 0.01  # 1% per trade
+    # Build equity curve (cumulative P&L)
+    # Base weight: 1% of capital per trade
+    base_weight = 0.01
+
+    # Calculate z_score weights for all trades
+    for t in all_trades:
+        t['z_weight'] = calculate_z_weight(t['z_score'], OPTIMAL_PARAMS['z_threshold'])
 
     cumulative_raw = 0.0
     cumulative_beta = 0.0
+    cumulative_weighted = 0.0
+    total_base_weight = 0.0
+    total_z_weight = 0.0
     equity_data = []
 
     for exit_date in sorted(trades_by_exit.keys()):
         trades = trades_by_exit[exit_date]
 
-        # Add P&L from each trade (weighted)
+        # Add P&L from each trade
         for t in trades:
-            cumulative_raw += t['return'] * trade_weight
-            cumulative_beta += t['beta_adj_return'] * trade_weight
+            # Unweighted (equal weight)
+            cumulative_raw += t['return'] * base_weight
+            cumulative_beta += t['beta_adj_return'] * base_weight
+            total_base_weight += base_weight
+
+            # Z-score weighted
+            z_weighted = base_weight * t['z_weight']
+            cumulative_weighted += t['beta_adj_return'] * z_weighted
+            total_z_weight += z_weighted
 
         equity_data.append({
             'date': exit_date,
             'raw_equity': 1.0 + cumulative_raw,  # Starting at $1
             'beta_equity': 1.0 + cumulative_beta,
+            'weighted_equity': 1.0 + cumulative_weighted,
             'n_trades': len(trades),
             'avg_return': np.mean([t['return'] for t in trades]),
             'avg_beta_return': np.mean([t['beta_adj_return'] for t in trades]),
+            'avg_z_weight': np.mean([t['z_weight'] for t in trades]),
         })
 
     # Convert to DataFrame
@@ -338,37 +378,47 @@ def main():
     # Calculate statistics
     total_raw_return = (eq_df['raw_equity'].iloc[-1] - 1) * 100
     total_beta_return = (eq_df['beta_equity'].iloc[-1] - 1) * 100
+    total_weighted_return = (eq_df['weighted_equity'].iloc[-1] - 1) * 100
     spy_total_return = (spy_normalized.iloc[-1] - 1) * 100
 
     n_years = (eq_df.index[-1] - eq_df.index[0]).days / 365
     annual_raw = ((eq_df['raw_equity'].iloc[-1]) ** (1/n_years) - 1) * 100 if n_years > 0 else 0
     annual_beta = ((eq_df['beta_equity'].iloc[-1]) ** (1/n_years) - 1) * 100 if n_years > 0 else 0
+    annual_weighted = ((eq_df['weighted_equity'].iloc[-1]) ** (1/n_years) - 1) * 100 if n_years > 0 else 0
     spy_annual = ((spy_normalized.iloc[-1]) ** (1/n_years) - 1) * 100 if n_years > 0 else 0
+
+    # Calculate improvement from weighting
+    improvement = total_weighted_return - total_beta_return
+    avg_z_weight = np.mean([t['z_weight'] for t in all_trades])
 
     print("\n" + "=" * 70)
     print("PERFORMANCE SUMMARY")
     print("=" * 70)
     print(f"Period: {eq_df.index[0].date()} to {eq_df.index[-1].date()} ({n_years:.1f} years)")
     print(f"Total Trades: {len(all_trades)}")
+    print(f"Average Z-Score Weight: {avg_z_weight:.2f}x")
     print(f"\nTotal Return:")
-    print(f"  Strategy (Raw):       {total_raw_return:+.1f}%")
-    print(f"  Strategy (Beta-Adj):  {total_beta_return:+.1f}%")
-    print(f"  SPY Buy & Hold:       {spy_total_return:+.1f}%")
+    print(f"  Strategy (Raw):         {total_raw_return:+.1f}%")
+    print(f"  Strategy (Beta-Adj):    {total_beta_return:+.1f}%")
+    print(f"  Strategy (Z-Weighted):  {total_weighted_return:+.1f}%  ({improvement:+.1f}% improvement)")
+    print(f"  SPY Buy & Hold:         {spy_total_return:+.1f}%")
     print(f"\nAnnualized Return:")
-    print(f"  Strategy (Raw):       {annual_raw:+.1f}%")
-    print(f"  Strategy (Beta-Adj):  {annual_beta:+.1f}%")
-    print(f"  SPY Buy & Hold:       {spy_annual:+.1f}%")
+    print(f"  Strategy (Raw):         {annual_raw:+.1f}%")
+    print(f"  Strategy (Beta-Adj):    {annual_beta:+.1f}%")
+    print(f"  Strategy (Z-Weighted):  {annual_weighted:+.1f}%")
+    print(f"  SPY Buy & Hold:         {spy_annual:+.1f}%")
 
     # Create the chart
     fig, axes = plt.subplots(3, 1, figsize=(14, 12))
 
     # Plot 1: Equity curves
     ax1 = axes[0]
-    ax1.plot(eq_df.index, eq_df['raw_equity'], label=f'Strategy Raw ({total_raw_return:+.1f}%)', linewidth=2, color='blue')
-    ax1.plot(eq_df.index, eq_df['beta_equity'], label=f'Strategy Beta-Adj ({total_beta_return:+.1f}%)', linewidth=2, color='green')
+    ax1.plot(eq_df.index, eq_df['raw_equity'], label=f'Strategy Raw ({total_raw_return:+.1f}%)', linewidth=1.5, color='blue', alpha=0.5)
+    ax1.plot(eq_df.index, eq_df['beta_equity'], label=f'Beta-Adj ({total_beta_return:+.1f}%)', linewidth=2, color='green')
+    ax1.plot(eq_df.index, eq_df['weighted_equity'], label=f'Z-Weighted ({total_weighted_return:+.1f}%)', linewidth=2, color='orange')
     ax1.plot(spy_normalized.index, spy_normalized.values, label=f'SPY Buy & Hold ({spy_total_return:+.1f}%)', linewidth=2, color='gray', alpha=0.7)
     ax1.axhline(y=1.0, color='black', linestyle='--', alpha=0.3)
-    ax1.set_title('Hurst Mean Reversion Strategy - Equity Curve (10 Years, 200 Stocks)', fontsize=14, fontweight='bold')
+    ax1.set_title('Hurst Mean Reversion Strategy - Equity Curve (10 Years, 200 Stocks)\nZ-Score Weighted: Higher weight for trades closer to threshold', fontsize=14, fontweight='bold')
     ax1.set_ylabel('Portfolio Value (starting at $1)')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
@@ -376,13 +426,13 @@ def main():
 
     # Plot 2: Drawdown
     ax2 = axes[1]
-    raw_peak = eq_df['raw_equity'].cummax()
-    raw_dd = (eq_df['raw_equity'] - raw_peak) / raw_peak * 100
     beta_peak = eq_df['beta_equity'].cummax()
     beta_dd = (eq_df['beta_equity'] - beta_peak) / beta_peak * 100
+    weighted_peak = eq_df['weighted_equity'].cummax()
+    weighted_dd = (eq_df['weighted_equity'] - weighted_peak) / weighted_peak * 100
 
-    ax2.fill_between(eq_df.index, raw_dd, 0, alpha=0.3, color='blue', label='Raw Drawdown')
     ax2.fill_between(eq_df.index, beta_dd, 0, alpha=0.3, color='green', label='Beta-Adj Drawdown')
+    ax2.fill_between(eq_df.index, weighted_dd, 0, alpha=0.3, color='orange', label='Z-Weighted Drawdown')
     ax2.set_title('Drawdown', fontsize=12)
     ax2.set_ylabel('Drawdown (%)')
     ax2.legend(loc='lower left')
@@ -406,7 +456,7 @@ def main():
 
     # Yearly breakdown
     print("\n" + "=" * 70)
-    print("YEARLY BREAKDOWN")
+    print("YEARLY BREAKDOWN (Z-Weighted)")
     print("=" * 70)
 
     # Group trades by year
@@ -417,20 +467,24 @@ def main():
             trades_by_year[year] = []
         trades_by_year[year].append(t)
 
-    print(f"\n{'Year':<6} | {'Trades':>7} | {'Avg Ret%':>10} | {'Avg Beta%':>10} | {'Year P&L%':>10} | {'Cumul P&L%':>10}")
-    print("-" * 75)
+    print(f"\n{'Year':<6} | {'Trades':>7} | {'Avg Beta%':>10} | {'Unwt P&L%':>10} | {'Wt P&L%':>10} | {'Cumul Wt%':>10}")
+    print("-" * 80)
 
-    cumul_pnl = 0.0
+    cumul_unweighted = 0.0
+    cumul_weighted = 0.0
     for year in sorted(trades_by_year.keys()):
         trades = trades_by_year[year]
-        avg_ret = np.mean([t['return'] for t in trades]) * 100
         avg_beta = np.mean([t['beta_adj_return'] for t in trades]) * 100
 
-        # Year P&L (sum of returns * weight)
-        year_pnl = sum(t['beta_adj_return'] for t in trades) * trade_weight * 100
-        cumul_pnl += year_pnl
+        # Unweighted P&L
+        year_unweighted = sum(t['beta_adj_return'] for t in trades) * base_weight * 100
+        cumul_unweighted += year_unweighted
 
-        print(f"{year:<6} | {len(trades):>7} | {avg_ret:>10.2f} | {avg_beta:>10.2f} | {year_pnl:>+10.2f} | {cumul_pnl:>+10.2f}")
+        # Z-weighted P&L
+        year_weighted = sum(t['beta_adj_return'] * t['z_weight'] for t in trades) * base_weight * 100
+        cumul_weighted += year_weighted
+
+        print(f"{year:<6} | {len(trades):>7} | {avg_beta:>10.2f} | {year_unweighted:>+10.2f} | {year_weighted:>+10.2f} | {cumul_weighted:>+10.2f}")
 
 
 if __name__ == "__main__":
