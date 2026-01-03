@@ -299,26 +299,29 @@ def main():
             trades_by_exit[exit_date] = []
         trades_by_exit[exit_date].append(t)
 
-    # Build equity curve (compounding returns)
-    cumulative_raw = 1.0
-    cumulative_beta = 1.0
+    # Build equity curve (cumulative P&L, equal weight per trade)
+    # Assume each trade uses 1% of capital (equal weight)
+    trade_weight = 0.01  # 1% per trade
+
+    cumulative_raw = 0.0
+    cumulative_beta = 0.0
     equity_data = []
 
     for exit_date in sorted(trades_by_exit.keys()):
         trades = trades_by_exit[exit_date]
-        avg_return = np.mean([t['return'] for t in trades])
-        avg_beta_return = np.mean([t['beta_adj_return'] for t in trades])
 
-        cumulative_raw *= (1 + avg_return)
-        cumulative_beta *= (1 + avg_beta_return)
+        # Add P&L from each trade (weighted)
+        for t in trades:
+            cumulative_raw += t['return'] * trade_weight
+            cumulative_beta += t['beta_adj_return'] * trade_weight
 
         equity_data.append({
             'date': exit_date,
-            'raw_equity': cumulative_raw,
-            'beta_equity': cumulative_beta,
+            'raw_equity': 1.0 + cumulative_raw,  # Starting at $1
+            'beta_equity': 1.0 + cumulative_beta,
             'n_trades': len(trades),
-            'avg_return': avg_return,
-            'avg_beta_return': avg_beta_return,
+            'avg_return': np.mean([t['return'] for t in trades]),
+            'avg_beta_return': np.mean([t['beta_adj_return'] for t in trades]),
         })
 
     # Convert to DataFrame
@@ -414,22 +417,20 @@ def main():
             trades_by_year[year] = []
         trades_by_year[year].append(t)
 
-    print(f"\n{'Year':<6} | {'Trades':>7} | {'Avg Ret%':>10} | {'Avg Beta%':>10} | {'Cumul Raw':>10} | {'Cumul Beta':>10}")
-    print("-" * 70)
+    print(f"\n{'Year':<6} | {'Trades':>7} | {'Avg Ret%':>10} | {'Avg Beta%':>10} | {'Year P&L%':>10} | {'Cumul P&L%':>10}")
+    print("-" * 75)
 
-    cumul_raw = 1.0
-    cumul_beta = 1.0
+    cumul_pnl = 0.0
     for year in sorted(trades_by_year.keys()):
         trades = trades_by_year[year]
         avg_ret = np.mean([t['return'] for t in trades]) * 100
         avg_beta = np.mean([t['beta_adj_return'] for t in trades]) * 100
 
-        # Calculate year's cumulative
-        for t in trades:
-            cumul_raw *= (1 + t['return'])
-            cumul_beta *= (1 + t['beta_adj_return'])
+        # Year P&L (sum of returns * weight)
+        year_pnl = sum(t['beta_adj_return'] for t in trades) * trade_weight * 100
+        cumul_pnl += year_pnl
 
-        print(f"{year:<6} | {len(trades):>7} | {avg_ret:>10.2f} | {avg_beta:>10.2f} | {(cumul_raw-1)*100:>10.1f}% | {(cumul_beta-1)*100:>10.1f}%")
+        print(f"{year:<6} | {len(trades):>7} | {avg_ret:>10.2f} | {avg_beta:>10.2f} | {year_pnl:>+10.2f} | {cumul_pnl:>+10.2f}")
 
 
 if __name__ == "__main__":
